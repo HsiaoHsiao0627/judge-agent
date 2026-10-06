@@ -16,6 +16,9 @@ from .config import JudgeConfig
 
 
 def compute_confidence(fair: dict, fraud: dict, cfg: JudgeConfig) -> float:
+    if fair.get("basis") == "fee_schedule_rule":
+        # 規則路徑不依賴先例池，先例數/離散度公式不適用
+        return cfg.rsa_rule_confidence
     conf = 1.0
     n = fair.get("precedent_n", 0)
     if n < cfg.min_precedents:

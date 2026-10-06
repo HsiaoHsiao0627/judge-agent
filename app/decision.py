@@ -92,8 +92,15 @@ def judge_decide(case: dict, cfg: JudgeConfig, amount_sources: dict, fault_retri
         reasons.append(f"comparable pool 離散度極端(dispersion_ratio={fair.get('dispersion_ratio')})，建議留意")
     if decision == "return_for_recalc":
         claim_str = f"{claim:,.0f}" if claim is not None else "N/A"
-        reasons.append(f"金額 {claim_str} 落在 Tukey 圍籬 {fair.get('fair_range')} 之外"
-                       + ("(已達退回上限，轉查缺漏)" if retry_exhausted else ""))
+        if fair.get("basis") == "fee_schedule_rule":
+            detail = "、".join(f"{i['item']} {i['amount']:,}" + ("(資料歸納)" if i["source"] == "data_inferred" else "")
+                              for i in fair.get("rule_items", []))
+            reasons.append(f"金額 {claim_str} 與費率表規則金額 {fair['rule_amount']:,} 相差 {fair['deviation_pct']:+.1f}%，"
+                           f"超出容許 ±{cfg.rsa_rule_tolerance * 100:g}%（規則明細：{detail}）"
+                           + ("(已達退回上限，轉查缺漏)" if retry_exhausted else ""))
+        else:
+            reasons.append(f"金額 {claim_str} 落在 Tukey 圍籬 {fair.get('fair_range')} 之外"
+                           + ("(已達退回上限，轉查缺漏)" if retry_exhausted else ""))
     if decision == "execute":
         reasons.append("公平合理且無阻擋，放行")
 

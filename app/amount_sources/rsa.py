@@ -121,6 +121,14 @@ class RSAValCaseLoader:
         (card_no, driver_id, report_date, report_time, complete_time,
          location, vendor_id, category_id, km, signed_amount) = row
         coverage = get_card_coverage(self.con, card_no) if card_no else {"found": False}
+        # 類別名稱與處理情形一律用「被載入的這個 db」自己的字典表：RSA_val.db 與 RSA_train.db 的
+        # category_id 3/4 語意對調、step_type_id 編號也不同，不能套用 train 的對照表。
+        cur.execute("SELECT category_name FROM processing_category WHERE category_id = ?", (category_id,))
+        cat_row = cur.fetchone()
+        category_name = cat_row[0] if cat_row else CATEGORY_NAMES.get(category_id)
+        cur.execute("SELECT t.step_name FROM service_processing_step s JOIN processing_step_type t "
+                    "ON s.step_type_id = t.step_type_id WHERE s.request_no = ? ORDER BY s.step_order", (request_no,))
+        processing_steps = [r[0] for r in cur.fetchall()]
 
         cur.execute("SELECT COUNT(*) FROM service_request WHERE card_no=? AND report_date=? "
                     "AND breakdown_location=? AND request_no!=?", (card_no, report_date, location, request_no))
@@ -134,7 +142,7 @@ class RSAValCaseLoader:
         return {
             "case_id": str(request_no), "line": "RSA", "found": True, "retry_count": retry_count,
             "claim_amount": signed_amount, "category_id": category_id,
-            "category_name": CATEGORY_NAMES.get(category_id), "km": km, "card_no": card_no,
+            "category_name": category_name, "processing_steps": processing_steps, "km": km, "card_no": card_no,
             "report_date": report_date, "report_time": report_time, "complete_time": complete_time,
             "breakdown_location": location, "vendor_id": vendor_id,
             "coverage_limit": coverage.get("coverage_limit"),

@@ -15,6 +15,7 @@ fairness.py — 金額公平性檢核（Tukey IQR 圍籬 + 離散度信心懲罰
 """
 import statistics as _stats
 from .config import JudgeConfig
+from .amount_sources.rsa_fee_rules import compute_rule_amount
 
 
 def _percentile(sorted_vals, p):
@@ -27,9 +28,50 @@ def _percentile(sorted_vals, p):
     return sorted_vals[f] + (sorted_vals[c] - sorted_vals[f]) * (k - f)
 
 
+def _rule_fairness(case: dict, cfg: JudgeConfig, rule: dict) -> dict:
+    """RSA 費率表規則路徑：claim_amount 與規則金額相差在 ±rsa_rule_tolerance 內即合理。"""
+    claim = case.get("claim_amount")
+    expected = rule["amount"]
+    tol = cfg.rsa_rule_tolerance
+    lo, hi = expected * (1 - tol), expected * (1 + tol)
+    within = None if claim is None else (lo <= claim <= hi)
+    deviation_pct = (claim - expected) / expected * 100.0 if (claim is not None and expected) else None
+    return {
+        "claim_amount": claim, "median": expected,
+        "fair_range": [round(lo), round(hi)], "fair_range_basis": f"fee_schedule_rule(±{tol * 100:g}%)",
+        "basis": "fee_schedule_rule",
+        "rule_amount": expected, "rule_items": rule["items"],
+        "rule_uses_data_inferred": rule.get("uses_data_inferred", False),
+        "q1": None, "q3": None, "iqr": None, "dispersion_ratio": None,
+        "extreme_dispersion": False, "extreme_dispersion_threshold": cfg.extreme_dispersion_threshold,
+        "deviation_pct": round(deviation_pct, 2) if deviation_pct is not None else None,
+        "within_tolerance": within,
+        "precedent_insufficient": False, "precedent_n": None, "tier": "rule",
+        "match_criteria": None,
+        "amount_basis": "道路救援服務項目及收費標準逐項計價（部分項目為資料歸納，見 rule_items[].source）",
+        "judgment_amounts_available": False,
+    }
+
+
 def fairness_check(case: dict, cfg: JudgeConfig, amount_source) -> dict:
     """amount_source 需實作 expected_amounts(case) -> dict，
-    回傳 {'general_amounts', 'n', 'tier', 'match_criteria', 'amount_basis', ...}。"""
+    回傳 {'general_amounts', 'n', 'tier', 'match_criteria', 'amount_basis', ...}。
+    RSA 且 rsa_rule_check_enabled：先試費率表規則；規則不適用（議價/缺欄位）才走 Tukey，
+    並把不適用原因放在 rule_check 欄位供稽核。"""
+    rule_check = None
+    if case.get("line") == "RSA" and cfg.rsa_rule_check_enabled:
+        rule = compute_rule_amount(case)
+        if rule["applicable"]:
+            return _rule_fairness(case, cfg, rule)
+        rule_check = {"applicable": False, "reason": rule["reason"],
+                      "negotiable": rule["negotiable"], "missing_fields": rule["missing_fields"]}
+    out = _tukey_fairness(case, cfg, amount_source)
+    if rule_check is not None:
+        out["rule_check"] = rule_check
+    return out
+
+
+def _tukey_fairness(case: dict, cfg: JudgeConfig, amount_source) -> dict:
     claim = case.get("claim_amount")
     exp = amount_source.expected_amounts(case)
     amounts = sorted(exp.get("general_amounts") or [])
@@ -62,6 +104,7 @@ def fairness_check(case: dict, cfg: JudgeConfig, amount_source) -> dict:
     return {
         "claim_amount": claim, "median": round(median),
         "fair_range": [round(lo), round(hi)], "fair_range_basis": f"tukey_iqr_fence(k={k})",
+        "basis": "tukey_iqr",
         "q1": round(q1), "q3": round(q3), "iqr": round(iqr),
         "dispersion_ratio": round(dispersion_ratio, 3) if dispersion_ratio is not None else None,
         "extreme_dispersion": extreme_dispersion,
