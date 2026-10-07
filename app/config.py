@@ -11,7 +11,7 @@ class JudgeConfig:
     amount_threshold: dict = field(default_factory=lambda: {"RSA": 200_000, "TPL": 500_000})
     min_precedents: int = 3              # 先例數低於此 → 先例覆蓋不足 → 轉人工
     confidence_threshold: float = 0.60   # 信心低於此 → 轉人工
-    max_retries: int = 2                 # 退回重算上限
+    max_retries: int = 2                 # 2026-10-07 起法官不再退回重算，保留欄位僅為相容
     policy_new_days: int = 14            # 投保後 N 天內出險視為短期 (A4)
     schema_version: str = "1.0"
     # RSA 費率表規則檢查（amount_sources/rsa_fee_rules.py）：費率表有明確價格的案件改用
