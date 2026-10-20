@@ -13,6 +13,7 @@ from datetime import datetime, timezone, timedelta
 from .config import JudgeConfig
 from .fairness import fairness_check
 from .fraud_rules import evaluate_fraud
+from .item_checks import evaluate_items
 from .confidence import compute_confidence, fraud_check_coverage
 from .tpl_similar import NoOpTplSimilarRetriever
 
@@ -28,6 +29,7 @@ def judge_decide(case: dict, cfg: JudgeConfig, amount_sources: dict, fault_retri
 
     fair = fairness_check(case, cfg, amount_source)
     fraud = evaluate_fraud(case, cfg)
+    item_checks = evaluate_items(case, cfg)
     confidence = compute_confidence(fair, fraud, cfg)
     coverage = fraud_check_coverage(fraud)
     retry_count = int(case.get("retry_count", 0))
@@ -52,7 +54,7 @@ def judge_decide(case: dict, cfg: JudgeConfig, amount_sources: dict, fault_retri
 
     if must_escalate:
         decision, next_agent = "escalate_human", "human_review"
-    elif within is False:
+    elif within is False or item_checks["hit"]:
         if retry_count < cfg.max_retries:
             decision, next_agent = "return_for_recalc", "claim_agent"
         else:
@@ -92,8 +94,12 @@ def judge_decide(case: dict, cfg: JudgeConfig, amount_sources: dict, fault_retri
         reasons.append(f"comparable pool 離散度極端(dispersion_ratio={fair.get('dispersion_ratio')})，建議留意")
     if decision == "return_for_recalc":
         claim_str = f"{claim:,.0f}" if claim is not None else "N/A"
-        reasons.append(f"金額 {claim_str} 落在 Tukey 圍籬 {fair.get('fair_range')} 之外"
-                       + ("(已達退回上限，轉查缺漏)" if retry_exhausted else ""))
+        if within is False:
+            reasons.append(f"金額 {claim_str} 落在 Tukey 圍籬 {fair.get('fair_range')} 之外"
+                           + ("(已達退回上限，轉查缺漏)" if retry_exhausted else ""))
+        for it in item_checks["items"]:
+            if it["status"] == "hit":
+                reasons.append(f"逐項核對：{it['reason']}" + ("(已達退回上限，轉查缺漏)" if retry_exhausted else ""))
     if decision == "execute":
         reasons.append("公平合理且無阻擋，放行")
 
@@ -105,6 +111,7 @@ def judge_decide(case: dict, cfg: JudgeConfig, amount_sources: dict, fault_retri
         "decision": decision, "next_agent": next_agent,
         "fairness_check": fair,
         "fraud_flags": fraud,
+        "item_checks": item_checks,
         "escalation_triggers": triggers,
         "fraud_warning_escalate": fraud_warning_escalate,
         "confidence": confidence,
