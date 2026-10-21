@@ -25,6 +25,7 @@ from datetime import datetime, timezone, timedelta
 from .config import JudgeConfig
 from .fairness import fairness_check
 from .fraud_rules import evaluate_fraud
+from .item_checks import evaluate_items
 from .confidence import compute_confidence, fraud_check_coverage
 from .tpl_similar import NoOpTplSimilarRetriever
 
@@ -37,6 +38,7 @@ CHECK_LABELS = {
     "rule_agent_cross_check": "規則代理人的交叉比對",
     "amount": "理賠金額",
     "reasoning_review": "理賠代理人的推理",
+    "item_amounts": "逐項金額",
 }
 
 
@@ -72,6 +74,10 @@ def _amount_check(case, fair, confidence, cfg):
     thr = cfg.amount_threshold.get(line, float("inf"))
     if claim is None:
         return _check("amount", "fail", "沒有收到理賠代理人的建議金額")
+    # 2026-10-21：核定金額不得高於請款金額（呼叫端須送 requested_amount，沒送就略過這一條）
+    requested = case.get("requested_amount")
+    if requested is not None and claim > requested:
+        return _check("amount", "fail", f"建議金額 {claim:,.0f} 高於請款金額 {requested:,.0f}")
     if claim > thr:
         return _check("amount", "fail", f"金額 {claim:,.0f} 超過 {line} 轉人工門檻 {thr:,.0f}")
     if fair.get("basis") == "fee_schedule_rule":
@@ -100,6 +106,16 @@ def _reasoning_check(rr):
     return _check("reasoning_review", "pass", "引用的案例與條款跟理賠代理人說的一致")
 
 
+def _item_check(item_checks):
+    """TPL 逐項核對（hfrl 分支）：有任何一項超出上限 → 不同意；全部 na → 不擋。"""
+    hits = [it for it in item_checks.get("items", []) if it["status"] == "hit"]
+    if hits:
+        return _check("item_amounts", "fail", "；".join(it["reason"] for it in hits))
+    if any(it["status"] == "pass" for it in item_checks.get("items", [])):
+        return _check("item_amounts", "pass", "逐項金額都在上限內")
+    return _check("item_amounts", "na", "沒有可核對的逐項金額")
+
+
 def _suspected_fraud(fraud, cfg):
     hits = [f for f in fraud["flags"] if f["status"] == "hit"]
     level = ("blocking" if fraud["blocking_hit"]
@@ -123,6 +139,7 @@ def judge_decide(case: dict, cfg: JudgeConfig, amount_sources: dict, fault_retri
 
     fair = fairness_check(case, cfg, amount_source)
     fraud = evaluate_fraud(case, cfg)
+    item_checks = evaluate_items(case, cfg)
     confidence = compute_confidence(fair, fraud, cfg)
     coverage = fraud_check_coverage(fraud)
     retry_count = int(case.get("retry_count", 0))
@@ -131,7 +148,8 @@ def judge_decide(case: dict, cfg: JudgeConfig, amount_sources: dict, fault_retri
         "applicable": False, "reviewed": False, "flagged": False, "issues": []}
     claim = case.get("claim_amount")
 
-    checks = _rule_agent_checks(case) + [_amount_check(case, fair, confidence, cfg), _reasoning_check(reasoning_review)]
+    checks = _rule_agent_checks(case) + [_amount_check(case, fair, confidence, cfg), _reasoning_check(reasoning_review),
+                                       _item_check(item_checks)]
     by_id = {c["id"]: c for c in checks}
     blocking = [c for c in checks
                 if c["status"] == "fail" or (c["status"] == "na" and c["id"].startswith("rule_agent"))]
@@ -180,6 +198,7 @@ def judge_decide(case: dict, cfg: JudgeConfig, amount_sources: dict, fault_retri
         "agreement": {"agree": agree, "checks": checks},
         "suspected_fraud": suspected_fraud,
         "fraud_flags": fraud,
+        "item_checks": item_checks,
         "escalation_triggers": triggers,
         "confidence": confidence,
         "llm_assisted": bool(reasoning_review.get("reviewed")) or tpl_similar_queried,

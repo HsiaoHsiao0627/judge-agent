@@ -21,7 +21,7 @@ from .schema import validate_output
 from .fault_consistency import get_fault_retriever
 from .tpl_similar import get_tpl_similar_retriever, NoOpTplSimilarRetriever
 from .reasoning_review import get_reasoning_reviewer, NoOpReasoningReviewer
-from .amount_sources.tpl import AmountComparator, MockAmountSource
+from .amount_sources.tpl import AmountComparator, KNNAmountComparator, MockAmountSource
 from .amount_sources.rsa import RSAAmountComparator, MockRSAAmountSource
 from .clause_sources.rsa_bm25 import RSABM25Retriever, MockRSABM25Retriever
 from .clause_sources.rsa_hybrid import get_hybrid_clause_retriever, MockRSAHybridClauseRetriever
@@ -49,8 +49,13 @@ def _startup():
     rsa_bm25_db = DATA_DIR / "RSA_BM25_clauses.db"
 
     if tpl_db.exists():
-        AMOUNT_SOURCES["TPL"] = AmountComparator(str(tpl_db), min_precedents=CFG.min_precedents)
-        print(f"[啟動] TPL AmountComparator 已連接: {tpl_db}")
+        if CFG.tpl_pool == "knn":
+            AMOUNT_SOURCES["TPL"] = KNNAmountComparator(str(tpl_db), k_neighbors=CFG.knn_neighbors,
+                                                        min_precedents=CFG.min_precedents)
+            print(f"[啟動] TPL KNNAmountComparator(k={CFG.knn_neighbors}) 已連接: {tpl_db}")
+        else:
+            AMOUNT_SOURCES["TPL"] = AmountComparator(str(tpl_db), min_precedents=CFG.min_precedents)
+            print(f"[啟動] TPL AmountComparator 已連接: {tpl_db}")
     else:
         AMOUNT_SOURCES["TPL"] = MockAmountSource()
         msg = f"[警告] 找不到 {tpl_db}，TPL 案件將使用 Mock 金額來源，不是真實判斷！"

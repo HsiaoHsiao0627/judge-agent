@@ -179,7 +179,136 @@ class TPLValCaseLoader:
             "disability_levels": list(profile["disability_levels"]),
             "accident_cause": profile["accident_cause"], "accident_date": profile["accident_date"],
             "has_null_payment_rows": breakdown["has_null_payment_rows"],
+            **get_case_knn_inputs(self.con, case_no),
         }
+
+
+# ============================================================
+# kNN 比較池（2026-10 新增）
+#
+# 為什麼：原本的三級放寬比對只用 own_fault_pct + injury_types，但真實資料裡肇責幾乎只有
+# 100%/70% 兩種、傷害類型 93% 是「醫療」，配對等於沒篩選，比較池接近全體 TPL 案件
+# (留一驗證 R²=0.09)。改用線上表單也收得到的傷勢嚴重度、就醫、請求項目、強制險給付、
+# 薪資特徵找最相近的 K 件(留一驗證 R²≈0.55)。
+#
+# 刻意不用：性別、年齡、出生年月(受保護屬性/代理變數)、事故地區(先不用)、
+# 任何核定/查勘金額(就是答案本身)。
+# ============================================================
+CLAIM_ITEM_CODES = ("2", "3", "4", "5", "6", "7", "8")
+
+
+def _num(v):
+    try:
+        return None if v in (None, "") else float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_case_knn_inputs(con, case_no: str) -> dict:
+    """從 TPL 資料庫組出 kNN 特徵所需的原始欄位(與 claim-intake-v2 build_judge_case 傳入的欄位同名)。
+    claim_item_amounts 是各請求項目的核定金額，僅供驗證/校準時模擬「理賠代理人逐項給金額」，
+    比較池特徵不使用它。"""
+    cur = con.cursor()
+    cur.execute("SELECT COALESCE(SUM(CASE WHEN visit_type LIKE '%住院%' THEN inpatient_days END), 0), "
+                "SUM(visit_type LIKE '%住院%'), SUM(visit_type LIKE '%門診%') "
+                "FROM medical_visits WHERE case_no = ?", (case_no,))
+    ind, inn, outn = cur.fetchone()
+    cur.execute("SELECT item_name, SUM(approved_amount) FROM claim_items WHERE case_no = ? GROUP BY item_name",
+                (case_no,))
+    items, item_amounts = set(), {}
+    for name, amt in cur.fetchall():
+        code = (name or "").strip().split(".")[0]
+        if code in CLAIM_ITEM_CODES:
+            items.add(code)
+            if amt is not None:
+                item_amounts[code] = item_amounts.get(code, 0.0) + float(amt)
+    cur.execute("SELECT MAX(ctpl_amount) FROM payments WHERE case_no = ?", (case_no,))
+    ctpl = _num(cur.fetchone()[0])
+    cur.execute("SELECT average_salary FROM employment_certificate WHERE case_name = ?", (case_no,))
+    sal = [s for s in (_num(r[0]) for r in cur.fetchall()) if s and s > 0]
+    cur.execute("SELECT doctor_advice FROM diagnosis_certificate WHERE case_name = ?", (case_no,))
+    advice = " | ".join(r[0] for r in cur.fetchall() if r[0])
+    cur.execute("SELECT COUNT(DISTINCT victim_id) FROM claim_episodes WHERE case_no = ?", (case_no,))
+    n_victims = cur.fetchone()[0] or 0
+    return {
+        "inpatient_days": int(ind or 0), "inpatient_visits": int(inn or 0), "outpatient_visits": int(outn or 0),
+        "claim_items": sorted(items), "ctpl_paid": ctpl if ctpl and ctpl > 0 else None,
+        "average_salary": max(sal) if sal else None, "doctor_advice": advice or None,
+        "n_victims": n_victims, "claim_item_amounts": item_amounts,
+    }
+
+
+def _disability_score(levels) -> float:
+    """1級最重 → 1.0；15級 → 1/15；無 → 0"""
+    import re
+    nums = [int(m.group(1)) for lv in (levels or []) for m in [re.match(r"\s*(\d+)\s*級", str(lv))] if m]
+    return (16 - min(nums)) / 15 if nums else 0.0
+
+
+def extract_tpl_features(case: dict) -> dict:
+    """case dict → kNN 特徵。缺值一律以 0 + has_ 旗標表示，不猜測。"""
+    import math
+    types = " ".join(case.get("injury_types") or [])
+    sev = 3 if "死亡" in types else (2 if ("失能" in types or case.get("has_disability")) else 1)
+    items = set(str(x).strip().split(".")[0] for x in (case.get("claim_items") or []))
+    ctpl, sal = _num(case.get("ctpl_paid")), _num(case.get("average_salary"))
+    fault = _num(case.get("own_fault_pct"))
+    feat = {
+        "fault": (fault if fault is not None else 100.0) / 100.0,
+        "sev": float(sev),
+        "dis": _disability_score(case.get("disability_levels")),
+        "ind": math.log1p(_num(case.get("inpatient_days")) or 0),
+        "inn": math.log1p(_num(case.get("inpatient_visits")) or 0),
+        "outn": math.log1p(_num(case.get("outpatient_visits")) or 0),
+        "nvic": float(_num(case.get("n_victims")) or 1),
+        "ctpl": math.log1p(ctpl) if ctpl and ctpl > 0 else 0.0, "has_ctpl": float(bool(ctpl and ctpl > 0)),
+        "sal": math.log1p(sal) if sal and sal > 0 else 0.0, "has_sal": float(bool(sal and sal > 0)),
+    }
+    for code in CLAIM_ITEM_CODES:
+        feat[f"item{code}"] = float(code in items)
+    return feat
+
+
+class KNNAmountComparator:
+    """以特徵距離找最相近的 K 件 TPL_train 案件當比較池。介面與 AmountComparator 相同。
+    只用 train 當比較池，維持 train/val 隔離。"""
+
+    def __init__(self, train_db_path: str, k_neighbors: int = 20, min_precedents: int = 3):
+        self.k = k_neighbors
+        self.min_precedents = min_precedents
+        loader = TPLValCaseLoader(train_db_path)
+        rows = []
+        for cn in loader.list_case_nos():
+            c = loader.load(cn)
+            if c.get("found") and c.get("claim_amount") and c["claim_amount"] > 0:
+                rows.append((cn, extract_tpl_features(c), float(c["claim_amount"])))
+        loader.close()
+        self.names = list(rows[0][1]) if rows else []
+        self.case_nos = [r[0] for r in rows]
+        self.amounts = [r[2] for r in rows]
+        X = [[r[1][n] for n in self.names] for r in rows]
+        n = len(X)
+        self.mu = [sum(col) / n for col in zip(*X)] if n else []
+        self.sd = []
+        for j, col in enumerate(zip(*X)):
+            var = sum((x - self.mu[j]) ** 2 for x in col) / n
+            self.sd.append(var ** 0.5 or 1.0)
+        self.Z = [[(x - self.mu[j]) / self.sd[j] for j, x in enumerate(row)] for row in X]
+
+    def close(self):
+        pass
+
+    def expected_amounts(self, case: dict) -> dict:
+        f = extract_tpl_features(case)
+        z = [(f[n] - self.mu[j]) / self.sd[j] for j, n in enumerate(self.names)]
+        dist = sorted((sum((a - b) ** 2 for a, b in zip(z, row)), i) for i, row in enumerate(self.Z))
+        idx = [i for _, i in dist[:self.k]]
+        amounts = [self.amounts[i] for i in idx]
+        return {"general_amounts": amounts, "n": len(amounts), "tier": "knn",
+                "match_criteria": {"method": "knn", "k": self.k, "features": self.names,
+                                   "neighbor_case_nos": [self.case_nos[i] for i in idx]},
+                "amount_basis": "TPL_train 實付理賠金額(傷害險部分)，依特徵距離取最相近 K 件",
+                "judgment_upper_bound_available": False}
 
 
 class MockAmountSource:

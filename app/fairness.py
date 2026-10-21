@@ -92,7 +92,7 @@ def _tukey_fairness(case: dict, cfg: JudgeConfig, amount_source) -> dict:
     iqr = q3 - q1
     dispersion_ratio = (iqr / median) if median else None
 
-    k = cfg.tukey_k
+    k = (getattr(cfg, "tukey_k_by_line", None) or {}).get(case.get("line"), cfg.tukey_k)
     lo = max(0.0, q1 - k * iqr)
     hi = q3 + k * iqr
     within = lo <= claim <= hi
