@@ -84,11 +84,22 @@ class AmountComparator:
     def close(self):
         self.con.close()
 
-    def _amounts_for(self, case_nos):
+    def _amounts_for(self, case_nos, item_code=None):
         if not case_nos:
             return []
         cur = self.con.cursor()
         qmarks = ",".join("?" * len(case_nos))
+        if item_code is not None:
+            # 單一請求項目(如 "8" 精神慰撫金)的核定金額；沒請求該項目的先例不算進比較池
+            cur.execute(
+                f"SELECT case_no, item_name, approved_amount FROM claim_items WHERE case_no IN ({qmarks})",
+                list(case_nos),
+            )
+            per_case = {}
+            for cn, name, amt in cur.fetchall():
+                if amt is not None and (name or "").strip().split(".")[0] == item_code:
+                    per_case[cn] = per_case.get(cn, 0.0) + float(amt)
+            return [(cn, a) for cn, a in per_case.items() if a > 0]
         cur.execute(
             f"SELECT case_no, SUM(CASE WHEN coverage_name LIKE '%傷害%' THEN payment_amount "
             f"ELSE 0 END) AS inj FROM payments WHERE case_no IN ({qmarks}) GROUP BY case_no",
@@ -96,7 +107,8 @@ class AmountComparator:
         )
         return [(r[0], r[1]) for r in cur.fetchall() if r[1] is not None and r[1] > 0]
 
-    def expected_amounts(self, case: dict) -> dict:
+    def expected_amounts(self, case: dict, item_code: Optional[str] = None) -> dict:
+        """item_code=None：傷害險實付總額；item_code="8" 等：同一套三級比對下該請求項目的核定金額。"""
         own_fault = case.get("own_fault_pct")
         injury_types = set(case.get("injury_types") or [])
         cause = case.get("accident_cause")
@@ -117,7 +129,7 @@ class AmountComparator:
             else:
                 tier1_cases = candidates
 
-        amounts = self._amounts_for(tier1_cases[:self.max_comparables])
+        amounts = self._amounts_for(tier1_cases[:self.max_comparables], item_code)
         tier, match_criteria = 1, {"own_fault_pct": own_fault, "injury_types": list(injury_types)}
 
         if len(amounts) < self.min_precedents:
@@ -128,7 +140,7 @@ class AmountComparator:
                     (own_fault - self.fault_tolerance_tier2, own_fault + self.fault_tolerance_tier2),
                 )
                 tier2_cases = [r[0] for r in cur.fetchall()]
-            amounts2 = self._amounts_for(tier2_cases[:self.max_comparables])
+            amounts2 = self._amounts_for(tier2_cases[:self.max_comparables], item_code)
             if len(amounts2) >= self.min_precedents:
                 amounts, tier = amounts2, 2
                 match_criteria = {"own_fault_pct_range":
@@ -137,14 +149,15 @@ class AmountComparator:
         if len(amounts) < self.min_precedents and cause is not None:
             cur.execute("SELECT case_no FROM cases WHERE accident_cause = ?", (cause,))
             tier3_cases = [r[0] for r in cur.fetchall()]
-            amounts3 = self._amounts_for(tier3_cases[:self.max_comparables])
+            amounts3 = self._amounts_for(tier3_cases[:self.max_comparables], item_code)
             if len(amounts3) > len(amounts):
                 amounts, tier = amounts3, 3
                 match_criteria = {"accident_cause": cause}
 
         return {"general_amounts": [a for _, a in amounts], "n": len(amounts),
                 "tier": tier if amounts else None, "match_criteria": match_criteria,
-                "amount_basis": "TPL_train 實付理賠金額(傷害險部分)，判決語料無金額欄位不適用",
+                "amount_basis": ("TPL_train 實付理賠金額(傷害險部分)，判決語料無金額欄位不適用" if item_code is None
+                                 else f"TPL_train 請求項目 {item_code} 核定金額(三級比對)"),
                 "judgment_upper_bound_available": False}
 
 
@@ -281,11 +294,13 @@ class KNNAmountComparator:
         for cn in loader.list_case_nos():
             c = loader.load(cn)
             if c.get("found") and c.get("claim_amount") and c["claim_amount"] > 0:
-                rows.append((cn, extract_tpl_features(c), float(c["claim_amount"])))
+                rows.append((cn, extract_tpl_features(c), float(c["claim_amount"]),
+                             c.get("claim_item_amounts") or {}))
         loader.close()
         self.names = list(rows[0][1]) if rows else []
         self.case_nos = [r[0] for r in rows]
         self.amounts = [r[2] for r in rows]
+        self.item_amounts = [r[3] for r in rows]
         X = [[r[1][n] for n in self.names] for r in rows]
         n = len(X)
         self.mu = [sum(col) / n for col in zip(*X)] if n else []
@@ -298,23 +313,34 @@ class KNNAmountComparator:
     def close(self):
         pass
 
-    def expected_amounts(self, case: dict) -> dict:
+    def expected_amounts(self, case: dict, item_code: Optional[str] = None) -> dict:
+        """item_code=None：傷害險實付總額；item_code="8" 等：只在有請求該項目的先例中取最相近 K 件。"""
         f = extract_tpl_features(case)
         z = [(f[n] - self.mu[j]) / self.sd[j] for j, n in enumerate(self.names)]
         dist = sorted((sum((a - b) ** 2 for a, b in zip(z, row)), i) for i, row in enumerate(self.Z))
-        idx = [i for _, i in dist[:self.k]]
-        amounts = [self.amounts[i] for i in idx]
+        if item_code is None:
+            idx = [i for _, i in dist[:self.k]]
+            amounts = [self.amounts[i] for i in idx]
+            basis = "TPL_train 實付理賠金額(傷害險部分)，依特徵距離取最相近 K 件"
+        else:
+            idx = [i for _, i in dist if (self.item_amounts[i].get(item_code) or 0) > 0][:self.k]
+            amounts = [self.item_amounts[i][item_code] for i in idx]
+            basis = f"TPL_train 請求項目 {item_code} 核定金額，依特徵距離取有請求該項目的最相近 K 件"
         return {"general_amounts": amounts, "n": len(amounts), "tier": "knn",
                 "match_criteria": {"method": "knn", "k": self.k, "features": self.names,
                                    "neighbor_case_nos": [self.case_nos[i] for i in idx]},
-                "amount_basis": "TPL_train 實付理賠金額(傷害險部分)，依特徵距離取最相近 K 件",
+                "amount_basis": basis,
                 "judgment_upper_bound_available": False}
 
 
 class MockAmountSource:
     """找不到真實 TPL_train.db 時的備援，讓服務至少能啟動並誠實回報。"""
 
-    def expected_amounts(self, case: dict) -> dict:
+    def expected_amounts(self, case: dict, item_code: Optional[str] = None) -> dict:
+        if item_code is not None:
+            return {"general_amounts": [], "n": 0, "tier": None, "match_criteria": {"mock": True},
+                    "amount_basis": "mock(未找到真實 TPL_train.db)，不提供逐項比較池",
+                    "judgment_upper_bound_available": False}
         base = case.get("_mock_market") or case.get("claim_amount", 100_000) or 100_000
         general = [round(base * f) for f in (0.3, 0.5, 0.7, 0.9, 1.0, 1.1, 1.4, 1.9, 2.6)]
         return {"general_amounts": general, "n": len(general), "tier": None,

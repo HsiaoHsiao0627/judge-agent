@@ -16,7 +16,7 @@ class JudgeConfig:
     tpl_pool: str = "tiered"             # TPL 比較池："tiered"(原三級放寬比對) 或 "knn"(特徵最近鄰，2026-10)；HFRL 校準時覆寫
     knn_neighbors: int = 20              # kNN 比較池取幾件
     item_care_daily_cap: float = 2500.0  # 看護費用每日上限(TPL_train 核定金額 p95≈2,200/日)
-    item_wl_ratio_cap: float = 2.0       # 工作損失上限倍數：× 日薪 × (住院+休養天數)(TPL_train p90≈2.1)
+    item_wl_ratio_cap: float = 1.0       # 已停用(2026-11-03)：工作損失只依案件薪資證明計算，不用 train 推得的倍數；保留欄位僅為相容
     policy_new_days: int = 14            # 投保後 N 天內出險視為短期 (A4)
     schema_version: str = "1.0"
     # RSA 費率表規則檢查（amount_sources/rsa_fee_rules.py）：費率表有明確價格的案件改用

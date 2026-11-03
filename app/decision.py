@@ -12,6 +12,8 @@ decision.py — 法官代理人核心決策邏輯（2026-10-07 改版）
   3. amount                  理賠金額合理：RSA 有價案件用收費標準規則 ±5%，其餘用 Tukey 圍籬；
                              超過轉人工門檻、先例不足或信心過低都算無法確認
   4. reasoning_review        理賠代理人的推理與引用沒有被 LLM 審查標記（未啟用審查時為「未審查」，不擋放行）
+  5. item_amounts            TPL 逐項上限（看護費用；工作損失只依案件薪資證明計算）
+  6. mental_damage           TPL 精神慰撫金單獨審查（與總額同一比較池、Tukey 圍籬；沒提供逐項金額時不擋）
   呼叫端沒有送 rule_agent 時，1、2 無法確認，一律轉人工。
 
 詐欺只做標註（suspected_fraud），不影響放行與否；命中的規則仍完整列在 fraud_flags。
@@ -26,6 +28,7 @@ from .config import JudgeConfig
 from .fairness import fairness_check
 from .fraud_rules import evaluate_fraud
 from .item_checks import evaluate_items
+from .mental_damage import evaluate_mental_damage
 from .confidence import compute_confidence, fraud_check_coverage
 from .tpl_similar import NoOpTplSimilarRetriever
 
@@ -39,6 +42,7 @@ CHECK_LABELS = {
     "amount": "理賠金額",
     "reasoning_review": "理賠代理人的推理",
     "item_amounts": "逐項金額",
+    "mental_damage": "精神慰撫金",
 }
 
 
@@ -140,6 +144,7 @@ def judge_decide(case: dict, cfg: JudgeConfig, amount_sources: dict, fault_retri
     fair = fairness_check(case, cfg, amount_source)
     fraud = evaluate_fraud(case, cfg)
     item_checks = evaluate_items(case, cfg)
+    mental_damage = evaluate_mental_damage(case, cfg, amount_source)
     confidence = compute_confidence(fair, fraud, cfg)
     coverage = fraud_check_coverage(fraud)
     retry_count = int(case.get("retry_count", 0))
@@ -150,6 +155,8 @@ def judge_decide(case: dict, cfg: JudgeConfig, amount_sources: dict, fault_retri
 
     checks = _rule_agent_checks(case) + [_amount_check(case, fair, confidence, cfg), _reasoning_check(reasoning_review),
                                        _item_check(item_checks)]
+    if line == "TPL":
+        checks.append(_check("mental_damage", mental_damage["status"], mental_damage["reason"]))
     by_id = {c["id"]: c for c in checks}
     blocking = [c for c in checks
                 if c["status"] == "fail" or (c["status"] == "na" and c["id"].startswith("rule_agent"))]
@@ -167,6 +174,7 @@ def judge_decide(case: dict, cfg: JudgeConfig, amount_sources: dict, fault_retri
         "precedent_insufficient": bool(fair.get("precedent_insufficient")),
         "low_confidence": confidence < cfg.confidence_threshold,
         "reasoning_review_flagged": bool(reasoning_review.get("flagged")),
+        "mental_damage_failed": mental_damage["status"] == "fail",
     }
     retry_exhausted = False
     # tpl_similar：只在案件觸發escalate_human時才呼叫(省LLM成本)，不是每案必打。
@@ -181,7 +189,9 @@ def judge_decide(case: dict, cfg: JudgeConfig, amount_sources: dict, fault_retri
     )
 
     if agree:
-        reasons = ["規則代理人的結論、交叉比對、理賠金額與推理都沒有問題，同意規則代理人的結論，放行"]
+        reasons = ["規則代理人的結論、交叉比對、理賠金額"
+                   + ("、精神慰撫金" if line == "TPL" and mental_damage["status"] == "pass" else "")
+                   + "與推理都沒有問題，同意規則代理人的結論，放行"]
     else:
         reasons = [f"{c['label']}：{c['detail']}" for c in blocking]
     if suspected_fraud["suspected"]:
@@ -199,6 +209,7 @@ def judge_decide(case: dict, cfg: JudgeConfig, amount_sources: dict, fault_retri
         "suspected_fraud": suspected_fraud,
         "fraud_flags": fraud,
         "item_checks": item_checks,
+        "mental_damage_check": mental_damage,
         "escalation_triggers": triggers,
         "confidence": confidence,
         "llm_assisted": bool(reasoning_review.get("reviewed")) or tpl_similar_queried,

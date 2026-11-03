@@ -8,11 +8,14 @@ item_checks.py — TPL 逐項金額核對（2026-10 新增）
 「單價 × 天數」的上限核對：
 
   I3 看護費用 ≤ care_daily_cap × (住院天數 + 醫囑專人照護天數)
-  I5 工作損失 ≤ wl_ratio_cap × (月薪/30) × (住院天數 + 醫囑休養天數)
+  I5 工作損失 ≤ (案件薪資證明的月薪/30) × (住院天數 + 醫囑休養天數)
 
-上限參數由 TPL_train 核定金額的分布推得，並可用 HFRL notebook 校準(見 config.py)。
+收入判斷（2026-11-03）：工作損失只依案件本身提供的薪資證明(case["average_salary"]，
+驗證時即驗證集的 employment_certificate)與醫囑天數計算，不再乘上從 TPL_train 核定金額
+分布推得的倍數——收入不可依訓練資料的經驗判賠。沒有薪資證明就標 na，不從訓練資料補估。
+看護費用的每日上限仍由 TPL_train 推得（與收入無關）。
 缺任何一項輸入(沒逐項金額、沒薪資、醫囑讀不到天數)一律標 na，不猜測、不觸發。
-與詐欺旗標同一原則：只能觸發退回重算，不修改金額。
+命中只會讓法官不同意、轉人工，不修改金額。
 """
 from .advice_parse import rest_days, care_days
 from .config import JudgeConfig
@@ -62,12 +65,14 @@ def check_work_loss(case: dict, cfg: JudgeConfig) -> dict:
     if rd is None:
         return _item("I5_WORK_LOSS", "工作損失", "na", reason="醫囑未載明休養期間")
     days = ind + rd
-    cap = cfg.item_wl_ratio_cap * sal / 30 * days
+    # 收入只採案件提供的薪資證明，不乘任何由訓練資料推得的倍數
+    cap = sal / 30 * days
     hit = amt > cap
     return _item("I5_WORK_LOSS", "工作損失", "hit" if hit else "pass",
                  {"amount": amt, "average_salary": sal, "inpatient_days": ind, "rest_days_advised": rd,
-                  "cap": round(cap)},
-                 f"工作損失 {amt:,.0f} 超過上限 {cap:,.0f}（{cfg.item_wl_ratio_cap:g} × 日薪 × {days:g} 日）" if hit else "")
+                  "cap": round(cap), "income_basis": "案件提供的薪資證明(average_salary)，未使用訓練資料"},
+                 f"工作損失 {amt:,.0f} 超過依薪資證明計算的金額 {cap:,.0f}"
+                 f"（月薪 {sal:,.0f} ÷ 30 × {days:g} 日）" if hit else "")
 
 
 def evaluate_items(case: dict, cfg: JudgeConfig) -> dict:
