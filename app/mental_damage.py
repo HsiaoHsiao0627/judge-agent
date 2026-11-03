@@ -3,7 +3,8 @@
 mental_damage.py — TPL 精神慰撫金審查（2026-11-03 新增）
 
 TPL 案件除了審理傷害險總額(fairness.py)，另外單獨審理精神慰撫金(請求項目 8)：
-理賠代理人在 case["claim_item_amounts"]["8"] 提供的精神慰撫金，與「同一個比較池」
+理賠代理人建議的精神慰撫金 case["suggested_mental_damage"]（理賠代理人 breakdown.net_mental；
+沒有送時退回審保戶請款的 case["claim_item_amounts"]["8"]，並在 amount_source 註明），與「同一個比較池」
 (TPL_train，tiered 或 kNN，跟總額用同一套比對方式)中有請求精神慰撫金的先例金額比較，
 用與總額相同的 Tukey IQR 圍籬判斷是否合理。
 
@@ -40,10 +41,12 @@ class _ItemPool:
 def evaluate_mental_damage(case: dict, cfg: JudgeConfig, amount_source) -> dict:
     if case.get("line") != "TPL":
         return {"applicable": False, "status": "na", "reason": "僅適用 TPL"}
-    amt = _num((case.get("claim_item_amounts") or {}).get(MENTAL_DAMAGE_CODE))
+    amt, source = _num(case.get("suggested_mental_damage")), "claim_agent"
     if amt is None or amt <= 0:
-        return {"applicable": False, "status": "na", "claim_amount": None,
-                "reason": "理賠代理人沒有提供精神慰撫金逐項金額"}
+        amt, source = _num((case.get("claim_item_amounts") or {}).get(MENTAL_DAMAGE_CODE)), "requested"
+    if amt is None or amt <= 0:
+        return {"applicable": False, "status": "na", "claim_amount": None, "amount_source": None,
+                "reason": "沒有理賠代理人建議或保戶請款的精神慰撫金金額"}
     fair = _tukey_fairness({**case, "claim_amount": amt}, cfg, _ItemPool(amount_source, MENTAL_DAMAGE_CODE))
     if fair.get("precedent_insufficient") or fair.get("within_tolerance") is None:
         status = "fail"
@@ -54,4 +57,7 @@ def evaluate_mental_damage(case: dict, cfg: JudgeConfig, amount_source) -> dict:
     else:
         status = "fail"
         reason = f"精神慰撫金 {amt:,.0f} 落在 {fair['precedent_n']} 筆先例的合理區間 {fair['fair_range']} 之外"
-    return {"applicable": True, "status": status, "claim_amount": amt, "reason": reason, "fairness": fair}
+    if source == "requested":
+        reason = "（審的是保戶請款金額）" + reason
+    return {"applicable": True, "status": status, "claim_amount": amt, "amount_source": source,
+            "reason": reason, "fairness": fair}

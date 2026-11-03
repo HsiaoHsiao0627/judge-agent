@@ -4,7 +4,16 @@ decision.py — 法官代理人核心決策邏輯（2026-10-07 改版）
 
 法官只做一件決定：是否同意規則代理人的結論。
   同意 → execute（放行）；不同意或無法確認 → escalate_human（轉人工）。
-  不再產生 return_for_recalc：claim-agent 收不到退回理由，重算不會改變結果。
+
+2026-11-03 TPL 退回重算（只限 cfg.recalc_lines）：沒過的檢查「全部」都是理賠代理人改得動的項目時，
+  不直接轉人工，而是 return_for_recalc、next_agent="claim_agent"，附 recalc_request 告訴理賠代理人
+  要往哪個方向重算；最多退回 cfg.max_retries(3) 次，第 4 次審核仍不通過 → escalate_human、retry_exhausted。
+  理賠代理人改得動的項目：
+    - 總額落在 Tukey 合理區間外（偏高→調低／偏低→調高）、建議金額高於請款金額（調低）
+    - 精神慰撫金落在合理區間外（審的是理賠代理人的建議值 suggested_mental_damage）
+    - 推理審查被標記（請理賠代理人帶著問題重寫說明）
+  其餘不通過（規則代理人結論／交叉比對、先例不足、超過轉人工門檻、信心過低、逐項上限）重算也不會改變，
+  只要有任何一項就直接轉人工。法官只指出方向，不指定金額；金額仍由理賠代理人自己的模型決定。
 
 「同意」需要以下四項檢查都沒有失敗：
   1. rule_agent_conclusion   規則代理人的受理結論是「可受理」（RSA: ELIGIBLE_FOR_PROCESS／TPL: 理賠）
@@ -44,6 +53,7 @@ CHECK_LABELS = {
     "item_amounts": "逐項金額",
     "mental_damage": "精神慰撫金",
 }
+DIRECTION_NAMES = {"lower": "調低", "higher": "調高"}
 
 
 def _check(cid, status, detail):
@@ -134,6 +144,40 @@ def _suspected_fraud(fraud, cfg):
     }
 
 
+def _direction(value, fair_range):
+    if not fair_range or value is None:
+        return None
+    return "lower" if value > fair_range[1] else "higher" if value < fair_range[0] else None
+
+
+def _recalc_target(check, case, fair, confidence, mental, reasoning_review, cfg):
+    """沒過的檢查 → 理賠代理人該怎麼重算；回傳 None 代表重算改變不了，必須轉人工。
+    判斷順序跟 _amount_check 相同，確保「為什麼沒過」與「能不能重算」一致。"""
+    cid = check["id"]
+    if cid == "amount":
+        claim, requested = case.get("claim_amount"), case.get("requested_amount")
+        if claim is None:
+            return None
+        if requested is not None and claim > requested:
+            return {"target": "total", "direction": "lower", "bound": requested, "reason": check["detail"]}
+        if claim > cfg.amount_threshold.get(case.get("line"), float("inf")):
+            return None
+        if fair.get("basis") != "tukey_iqr" or fair.get("precedent_insufficient") or confidence < cfg.confidence_threshold:
+            return None
+        d = _direction(claim, fair.get("fair_range"))
+        return d and {"target": "total", "direction": d, "fair_range": fair["fair_range"], "reason": check["detail"]}
+    if cid == "mental_damage":
+        mf = mental.get("fairness") or {}
+        if mental.get("amount_source") != "claim_agent" or mf.get("precedent_insufficient"):
+            return None
+        d = _direction(mental.get("claim_amount"), mf.get("fair_range"))
+        return d and {"target": "mental", "direction": d, "fair_range": mf["fair_range"], "reason": check["detail"]}
+    if cid == "reasoning_review":
+        return {"target": "reasoning", "issues": list(reasoning_review.get("issues") or []) or [check["detail"]],
+                "reason": check["detail"]}
+    return None
+
+
 def judge_decide(case: dict, cfg: JudgeConfig, amount_sources: dict, fault_retriever=None,
                   reasoning_reviewer=None, tpl_similar_retriever=None) -> dict:
     line = case.get("line")
@@ -161,7 +205,14 @@ def judge_decide(case: dict, cfg: JudgeConfig, amount_sources: dict, fault_retri
     blocking = [c for c in checks
                 if c["status"] == "fail" or (c["status"] == "na" and c["id"].startswith("rule_agent"))]
     agree = not blocking
-    decision, next_agent = ("execute", "frontend") if agree else ("escalate_human", "human_review")
+    targets = [_recalc_target(c, case, fair, confidence, mental_damage, reasoning_review, cfg) for c in blocking]
+    recalc_possible = bool(blocking) and line in cfg.recalc_lines and all(targets)
+    if agree:
+        decision, next_agent = "execute", "frontend"
+    elif recalc_possible and retry_count < cfg.max_retries:
+        decision, next_agent = "return_for_recalc", "claim_agent"
+    else:
+        decision, next_agent = "escalate_human", "human_review"
     suspected_fraud = _suspected_fraud(fraud, cfg)
 
     amt_thr = cfg.amount_threshold.get(line, float("inf"))
@@ -176,7 +227,11 @@ def judge_decide(case: dict, cfg: JudgeConfig, amount_sources: dict, fault_retri
         "reasoning_review_flagged": bool(reasoning_review.get("flagged")),
         "mental_damage_failed": mental_damage["status"] == "fail",
     }
-    retry_exhausted = False
+    retry_exhausted = recalc_possible and retry_count >= cfg.max_retries
+    recalc_request = None
+    if decision == "return_for_recalc":
+        recalc_request = {"target_agent": "claim_agent", "return_no": retry_count + 1,
+                          "max_returns": cfg.max_retries, "targets": targets}
     # tpl_similar：只在案件觸發escalate_human時才呼叫(省LLM成本)，不是每案必打。
     # 這條線純粹補充參考資訊給human_review用，不影響上面已經拍板的decision，
     # 呼叫時機放在decision確定之後，避免retriever結果反過來影響決策邏輯。
@@ -194,6 +249,13 @@ def judge_decide(case: dict, cfg: JudgeConfig, amount_sources: dict, fault_retri
                    + "與推理都沒有問題，同意規則代理人的結論，放行"]
     else:
         reasons = [f"{c['label']}：{c['detail']}" for c in blocking]
+        if decision == "return_for_recalc":
+            how = "、".join(("重寫推理說明" if t["target"] == "reasoning" else
+                            ("總額" if t["target"] == "total" else "精神慰撫金") + DIRECTION_NAMES[t["direction"]])
+                           for t in targets)
+            reasons.insert(0, f"退回理賠代理人重算（第 {retry_count + 1}/{cfg.max_retries} 次）：{how}")
+        elif retry_exhausted:
+            reasons.insert(0, f"已退回理賠代理人重算 {cfg.max_retries} 次仍未通過，轉人工")
     if suspected_fraud["suspected"]:
         reasons.append("標註疑似詐欺（僅供參考，不影響放行）："
                        + "、".join(h["reason"] or h["flag_id"] for h in suspected_fraud["hit_flags"]))
@@ -206,6 +268,7 @@ def judge_decide(case: dict, cfg: JudgeConfig, amount_sources: dict, fault_retri
         "decision": decision, "next_agent": next_agent,
         "fairness_check": fair,
         "agreement": {"agree": agree, "checks": checks},
+        "recalc_request": recalc_request,
         "suspected_fraud": suspected_fraud,
         "fraud_flags": fraud,
         "item_checks": item_checks,

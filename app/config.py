@@ -12,7 +12,8 @@ class JudgeConfig:
     amount_threshold: dict = field(default_factory=lambda: {"RSA": 200_000, "TPL": 500_000})
     min_precedents: int = 3              # 先例數低於此 → 先例覆蓋不足 → 轉人工
     confidence_threshold: float = 0.60   # 信心低於此 → 轉人工
-    max_retries: int = 2                 # 2026-10-07 起法官不再退回重算，保留欄位僅為相容
+    max_retries: int = 3                 # 2026-11-03：TPL 退回理賠代理人重算最多 3 次，第 4 次審核仍不通過才轉人工
+    recalc_lines: tuple = ("TPL",)       # 會退回重算的險種；RSA 維持不同意即轉人工
     tpl_pool: str = "tiered"             # TPL 比較池："tiered"(原三級放寬比對) 或 "knn"(特徵最近鄰，2026-10)；HFRL 校準時覆寫
     knn_neighbors: int = 20              # kNN 比較池取幾件
     item_care_daily_cap: float = 2500.0  # 看護費用每日上限(TPL_train 核定金額 p95≈2,200/日)
